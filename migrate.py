@@ -70,10 +70,77 @@ def migrate_spreadsheet(file_path, org_name):
     except Exception as e:
         print(f"Error during migration: {e}")
 
+#migrate the prices from the excel
+def migrate_products_and_prices(file_path):
+    try:
+        print(f"Reading PRECIOS sheet from: {file_path}...")
+        df_prices = pd.read_excel(file_path, sheet_name="PRECIOS").dropna(subset=['INSUMOS'])
+
+        print("Connecting to Supabase to migrate prices...")
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+
+        baseline_date = '2022-01-01'
+
+        print("Migrating products with Bodega base-unit structure...")
+        for _, row in df_prices.iterrows():
+            product_name = str(row['INSUMOS']).strip()
+
+            # Extract values
+            tamano_kg = float(row['TAMANO KG'])
+            precio_kg = float(row['PRECIO/KG'])
+
+            # Categorize feed vs insumos
+            name_lower = product_name.lower()
+            if "balanceado" in name_lower or "skretting" in name_lower or "nicovita" in name_lower:
+                category = "feed"
+            else:
+                category = "insumo"
+
+            # 1. Insert Product (Ready for Bodega logic)
+            cur.execute("""
+                        INSERT INTO products (name, category, base_unit, package_weight_kg)
+                        VALUES (%s, %s, 'kg', %s)
+                        ON CONFLICT ON CONSTRAINT unique_product_name DO NOTHING
+                        RETURNING product_id;
+                        """, (product_name, category, tamano_kg))
+
+            result = cur.fetchone()
+            if result:
+                product_id = result[0]
+            else:
+                cur.execute("SELECT product_id FROM products WHERE name = %s;", (product_name,))
+                product_id = cur.fetchone()[0]
+
+            # 2. Insert the Price (We store the per-KG price as the ultimate source of truth)
+            cur.execute("""
+                        SELECT price_id
+                        FROM product_prices
+                        WHERE product_id = %s
+                          AND effective_date = %s;
+                        """, (product_id, baseline_date))
+
+            if not cur.fetchone():
+                cur.execute("""
+                            INSERT INTO product_prices (product_id, unit_price, effective_date)
+                            VALUES (%s, %s, %s);
+                            """, (product_id, precio_kg, baseline_date))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"Price migration complete! Bodega-ready structure established.")
+
+    except Exception as e:
+        print(f"Error during price migration: {e}")
+
 
 if __name__ == "__main__":
-    # Runs the migration for your main spreadsheet file
+    # 1. Migrate the camaroneras and ponds
     migrate_spreadsheet("Calculos_Camaronera.xlsx", org_name="CAMAGUI")
+
+    # 2. Migrate the products and initial prices
+    migrate_products_and_prices("Calculos_Camaronera.xlsx")
 
     # Later on, when you want to ingest your second file, you can easily add:
     # migrate_spreadsheet("Calculos_Camaronera_Sociedad.xlsx", org_name="New Farm Entity")

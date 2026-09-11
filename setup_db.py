@@ -13,15 +13,18 @@ def create_tables():
         cur = conn.cursor()
 
         # 1. Drop existing tables to ensure a clean slate
+        # Note: We must drop tables that have foreign keys first (prices depend on products)
         print("Dropping old tables...")
         cur.execute("""
+                    DROP TABLE IF EXISTS product_prices CASCADE;
+                    DROP TABLE IF EXISTS products CASCADE;
                     DROP TABLE IF EXISTS ponds CASCADE;
                     DROP TABLE IF EXISTS farms CASCADE;
                     DROP TABLE IF EXISTS organizations CASCADE;
                     """)
 
-        # 2. Create tables with explicit constraints
-        print("Creating fresh database tables and constraints...")
+        # 2. Create the core organizational tables
+        print("Creating core structure (organizations, farms, ponds)...")
 
         cur.execute("""
                     CREATE TABLE organizations
@@ -53,6 +56,33 @@ def create_tables():
                         pond_name  VARCHAR(50)   NOT NULL,
                         hectares   NUMERIC(6, 2) NOT NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """)
+
+        # 3. Create the inventory and pricing tables
+        print("Creating inventory and pricing tables...")
+
+        cur.execute("""
+                    CREATE TABLE products (
+                        product_id SERIAL PRIMARY KEY,
+                        name VARCHAR(150) NOT NULL,
+                        category VARCHAR(50), 
+                        base_unit VARCHAR(20) DEFAULT 'kg', 
+                        package_weight_kg NUMERIC(6, 2) NOT NULL, -- Pulls from TAMANO KG
+                        CONSTRAINT unique_product_name UNIQUE (name),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """)
+
+        cur.execute("""
+                    CREATE TABLE product_prices
+                    (
+                        price_id       SERIAL PRIMARY KEY,
+                        product_id     INT            NOT NULL REFERENCES products (product_id) ON DELETE CASCADE,
+                        unit_price     NUMERIC(10, 4) NOT NULL,
+                        effective_date DATE           NOT NULL,
+                        end_date       DATE,
+                        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                     """)
 
