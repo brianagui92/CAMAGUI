@@ -57,29 +57,42 @@ def create_tables():
         cur.execute("""
             CREATE TABLE products (
                 product_id SERIAL PRIMARY KEY,
-                name VARCHAR(150) NOT NULL UNIQUE,
-                category VARCHAR(50), 
-                base_unit VARCHAR(20) DEFAULT 'kg', 
-                package_weight_kg NUMERIC(6, 2) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                name VARCHAR(150) NOT NULL,
+                product_code VARCHAR(50) UNIQUE NOT NULL,  -- The new bridge column
+                category VARCHAR(50) NOT NULL,
+                base_unit VARCHAR(20) DEFAULT 'kg',
+                package_weight_kg NUMERIC(6, 2)
             );
 
             CREATE TABLE product_prices (
                 price_id SERIAL PRIMARY KEY,
                 product_id INT NOT NULL REFERENCES products(product_id) ON DELETE CASCADE,
-                unit_price NUMERIC(10, 4) NOT NULL,
+                package_price NUMERIC(10, 2) NOT NULL, -- Total cost of the bag/package
                 effective_date DATE NOT NULL,
                 end_date DATE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            -- Dynamic View to calculate price/kg on the fly
+            CREATE OR REPLACE VIEW vw_current_product_prices AS
+            SELECT 
+                pp.price_id,
+                p.product_id,
+                p.name AS product_name,
+                p.package_weight_kg,
+                pp.package_price,
+                ROUND((pp.package_price / NULLIF(p.package_weight_kg, 0)), 4) AS price_per_kg,
+                pp.effective_date,
+                pp.end_date
+            FROM product_prices pp
+            JOIN products p ON pp.product_id = p.product_id;
+
             CREATE TABLE feeding_curves (
                 curve_id SERIAL PRIMARY KEY,
-                name VARCHAR(100) NOT NULL,
-                min_weight_g NUMERIC(5, 2) NOT NULL,
-                max_weight_g NUMERIC(5, 2) NOT NULL,
-                feeding_rate_pct NUMERIC(5, 3) NOT NULL,
-                notes TEXT,
+                curve_name VARCHAR(50) NOT NULL,
+                weight_waypoint_g NUMERIC(6, 2) NOT NULL,
+                target_bw_pct NUMERIC(6, 3) NOT NULL,    -- The smoothed, single percentage
+                CONSTRAINT unique_curve_waypoint UNIQUE (curve_name, weight_waypoint_g),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -158,29 +171,15 @@ def create_tables():
                 log_id SERIAL PRIMARY KEY,
                 cycle_id INT NOT NULL REFERENCES growout_cycles(cycle_id) ON DELETE CASCADE,
                 log_date DATE NOT NULL,
-
-                feed_product_id INT REFERENCES products(product_id),
-                raw_feed_name VARCHAR(150),
-                weekly_feed_kg NUMERIC(10, 2) NOT NULL,
-                weekly_feed_cost NUMERIC(10, 2),
-                ultimo_tope_kg NUMERIC(10, 2) NOT NULL,
-                sampled_weight_g NUMERIC(6, 2) NOT NULL,
-                weekly_growth_g NUMERIC(5, 2),
-                weekly_fcr NUMERIC(4, 2),
-
-                calculated_feed_rate_pct NUMERIC(5, 3),
-                calculated_animals_by_tope NUMERIC(12, 2),
-                calculated_survival_tope_pct NUMERIC(5, 2),
-
-                calibrated_survival_pct NUMERIC(5, 2) NOT NULL,
-                projected_density_per_ha NUMERIC(10, 2),
-                manual_projected_growth_g NUMERIC(5, 2) NOT NULL,
-                target_weight_g NUMERIC(6, 2) NOT NULL,
-                projected_feed_rate_pct NUMERIC(5, 3),
-                nuevo_tope_kg NUMERIC(10, 2) NOT NULL,
-
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT unique_cycle_log_date UNIQUE (cycle_id, log_date)
+    
+                -- The Core Realities (Inputs)
+                ultimo_tope_kg NUMERIC(10, 2),
+                feed_consumed_kg NUMERIC(10, 2),
+                product_id INT REFERENCES products(product_id),  -- <-- The Relational Link
+                actual_weight_g NUMERIC(10, 2),
+    
+                CONSTRAINT unique_cycle_date UNIQUE (cycle_id, log_date),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
 

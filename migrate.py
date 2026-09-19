@@ -96,6 +96,9 @@ def migrate_products_and_prices(file_path):
         print(f"\n[2/3] Reading PRECIOS sheet from {file_path}...")
         df_prices = pd.read_excel(file_path, sheet_name="PRECIOS").dropna(subset=["INSUMOS"])
 
+        # Clean headers to ensure "PRECIO" is found accurately
+        df_prices.columns = [re.sub(r'\s+', ' ', str(col)).strip() for col in df_prices.columns]
+
         with psycopg2.connect(DB_URL) as conn:
             with conn.cursor() as cur:
                 baseline_date = "2022-01-01"
@@ -103,8 +106,13 @@ def migrate_products_and_prices(file_path):
 
                 for _, row in df_prices.iterrows():
                     product_name = str(row["INSUMOS"]).strip()
+
+                    # Capture the short code (Fallback to the name if CODIGO is empty)
+                    raw_code = row.get("CODIGO")
+                    product_code = str(raw_code).strip() if pd.notna(raw_code) else product_name
+
                     tamano_kg = clean_val(row.get("TAMANO KG"), float) or 25.0
-                    precio_kg = clean_val(row.get("PRECIO/KG"), float) or 0.0
+                    package_price = clean_val(row.get("PRECIO"), float) or 0.0
 
                     name_lower = product_name.lower()
                     if any(x in name_lower for x in ["balanceado", "skretting", "nicovita"]):
@@ -112,24 +120,25 @@ def migrate_products_and_prices(file_path):
                     else:
                         category = "insumo"
 
-                    # Upsert Product
+                    # Upsert Product using product_code for the conflict
                     cur.execute("""
-                                INSERT INTO products (name, category, base_unit, package_weight_kg)
-                                VALUES (%s, %s, 'kg', %s)
-                                ON CONFLICT (name) DO UPDATE SET category          = EXCLUDED.category,
-                                                                 package_weight_kg = EXCLUDED.package_weight_kg
+                                INSERT INTO products (name, product_code, category, base_unit, package_weight_kg)
+                                VALUES (%s, %s, %s, 'kg', %s)
+                                ON CONFLICT (product_code) DO UPDATE SET name              = EXCLUDED.name,
+                                                                         category          = EXCLUDED.category,
+                                                                         package_weight_kg = EXCLUDED.package_weight_kg
                                 RETURNING product_id;
-                                """, (product_name, category, tamano_kg))
+                                """, (product_name, product_code, category, tamano_kg))
                     product_id = cur.fetchone()[0]
 
-                    # Insert Price Timeline (Avoid Duplicates)
+                    # Insert Price Timeline
                     cur.execute("SELECT price_id FROM product_prices WHERE product_id = %s AND effective_date = %s;",
                                 (product_id, baseline_date))
                     if not cur.fetchone():
                         cur.execute("""
-                                    INSERT INTO product_prices (product_id, unit_price, effective_date)
+                                    INSERT INTO product_prices (product_id, package_price, effective_date)
                                     VALUES (%s, %s, %s);
-                                    """, (product_id, precio_kg, baseline_date))
+                                    """, (product_id, package_price, baseline_date))
 
         print("✓ Products and price timeline migrated successfully.")
 
@@ -137,7 +146,6 @@ def migrate_products_and_prices(file_path):
         print(f"Error during price migration: {e}")
         traceback.print_exc()
         raise e
-
 
 # --- STEP 3: MIGRATE PRECRIA AND SIEMBRAS ---
 def migrate_precria_and_siembras(file_path, farm_name="CAMAGUI"):
@@ -289,9 +297,157 @@ def migrate_precria_and_siembras(file_path, farm_name="CAMAGUI"):
         raise e
 
 
+# --- STEP 4: MIGRATE FEEDING CURVES ---
+def migrate_feeding_curves(file_path):
+    try:
+        print(f"\n[*] Reading feeding curves from {file_path}...")
+        df_curves = pd.read_excel(file_path, sheet_name="Masterline")
+        df_curves.columns = [re.sub(r'\s+', ' ', str(col)).strip() for col in df_curves.columns]
+
+        with psycopg2.connect(DB_URL) as conn:
+            with conn.cursor() as cur:
+                print("Ingesting smoothed Masterline waypoints...")
+
+                prev_bw_min = None
+                last_max_weight = None
+                last_bw_min = None
+
+                for _, row in df_curves.iterrows():
+                    waypoint_g = clean_val(row.get("PESO MIN (g)"), float)
+
+                    if waypoint_g is None:
+                        continue
+
+                    current_bw_min = clean_val(row.get("%BW Min"), float)
+                    current_bw_max = clean_val(row.get("%BW Max"), float)
+                    current_max_weight = clean_val(row.get("PESO MAX (g)"), float)
+
+                    if current_bw_min is None or current_bw_max is None:
+                        continue
+
+                    # Calculate smoothed target percentage
+                    if prev_bw_min is None:
+                        # First row logic
+                        target_pct = round((current_bw_min + current_bw_max) / 2.0, 3)
+                    else:
+                        # Smoothed biological decay logic
+                        target_pct = round((current_bw_max + prev_bw_min) / 2.0, 3)
+
+                    # Store variables for the next loop... and for the final anchor
+                    prev_bw_min = current_bw_min
+                    last_max_weight = current_max_weight
+                    last_bw_min = current_bw_min
+
+                    # Insert standard waypoint
+                    cur.execute("""
+                                INSERT INTO feeding_curves (curve_name, weight_waypoint_g, target_bw_pct)
+                                VALUES (%s, %s, %s)
+                                ON CONFLICT (curve_name, weight_waypoint_g) DO UPDATE SET target_bw_pct = EXCLUDED.target_bw_pct;
+                                """, ("Masterline", waypoint_g, target_pct))
+
+                # --- The Final Anchor (Closing the curve) ---
+                if last_max_weight is not None and last_bw_min is not None:
+                    # Rounding 30.99 to exactly 31 as requested
+                    final_waypoint_g = round(last_max_weight)
+
+                    cur.execute("""
+                                INSERT INTO feeding_curves (curve_name, weight_waypoint_g, target_bw_pct)
+                                VALUES (%s, %s, %s)
+                                ON CONFLICT (curve_name, weight_waypoint_g) DO UPDATE SET target_bw_pct = EXCLUDED.target_bw_pct;
+                                """, ("Masterline", final_waypoint_g, last_bw_min))
+
+                    print(f"  -> Added terminal anchor: {final_waypoint_g}g at {last_bw_min}%")
+
+        print("✓ Smoothed Masterline feeding curve ingested successfully.")
+
+    except Exception as e:
+        print(f"Error during feeding curve migration: {e}")
+        traceback.print_exc()
+        raise e
+
+
+# --- STEP 5: MIGRATE WEEKLY POND LOGS (RAW INPUTS ONLY) ---
+def migrate_weekly_logs(file_path):
+    try:
+        print(f"\n[*] Reading core weekly logs from {file_path}...")
+        df_logs = pd.read_excel(file_path, sheet_name="CAMAGUI DATA UNIFICADA")
+        df_logs.columns = [re.sub(r'\s+', ' ', str(col)).strip() for col in df_logs.columns]
+
+        with psycopg2.connect(DB_URL) as conn:
+            with conn.cursor() as cur:
+                print("Ingesting raw facts from CAMAGUI DATA UNIFICADA...")
+
+                # Cache Cycles
+                cur.execute("SELECT cycle_code, cycle_id FROM growout_cycles;")
+                cycle_map = {str(row[0]).strip(): row[1] for row in cur.fetchall()}
+
+                # Cache Products by CODE instead of name
+                cur.execute("SELECT LOWER(TRIM(product_code)), product_id FROM products;")
+                product_map = {row[0]: row[1] for row in cur.fetchall()}
+
+                def get_or_create_product(raw_feed_name):
+                    if pd.isna(raw_feed_name) or not str(raw_feed_name).strip():
+                        return None
+
+                    clean_code = str(raw_feed_name).strip()
+                    lookup_code = clean_code.lower()
+
+                    if lookup_code not in product_map:
+                        print(f"  [!] Auto-creating missing feed product by code: '{clean_code}'")
+                        # If auto-created, we just set the name and code to be identical
+                        cur.execute("""
+                                    INSERT INTO products (name, product_code, category, base_unit, package_weight_kg)
+                                    VALUES (%s, %s, 'feed', 'kg', 25.0)
+                                    RETURNING product_id;
+                                    """, (clean_code, clean_code))
+                        product_map[lookup_code] = cur.fetchone()[0]
+
+                    return product_map[lookup_code]
+
+                for _, row in df_logs.iterrows():
+                    raw_cycle = row.get("SIEMBRA ID #")
+                    if pd.isna(raw_cycle) or not str(raw_cycle).strip():
+                        continue
+
+                    cycle_code = str(raw_cycle).strip()
+                    cycle_id = cycle_map.get(cycle_code)
+
+                    if not cycle_id:
+                        continue
+
+                    log_date = clean_date(row.get("FECHA"))
+                    if not log_date:
+                        continue
+
+                    # The 4 Core Realities
+                    ultimo_tope = clean_val(row.get("ULTIMO TOPE (Kg)"))
+                    consumo = clean_val(row.get("CONSUMO SEMANA (Kg)"))
+                    peso_actual = clean_val(row.get("PESO ACTUAL"))
+
+                    # Relational Product Lookup
+                    product_id = get_or_create_product(row.get("NOMBRE BALANCEAD."))
+
+                    cur.execute("""
+                                INSERT INTO weekly_pond_logs (cycle_id, log_date, ultimo_tope_kg, feed_consumed_kg,
+                                                              product_id, actual_weight_g)
+                                VALUES (%s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (cycle_id, log_date) DO UPDATE SET ultimo_tope_kg   = EXCLUDED.ultimo_tope_kg,
+                                                                               feed_consumed_kg = EXCLUDED.feed_consumed_kg,
+                                                                               product_id       = EXCLUDED.product_id,
+                                                                               actual_weight_g  = EXCLUDED.actual_weight_g;
+                                """, (cycle_id, log_date, ultimo_tope, consumo, product_id, peso_actual))
+
+        print("✓ Raw weekly pond logs migrated successfully.")
+
+    except Exception as e:
+        print(f"Error during weekly log migration: {e}")
+        traceback.print_exc()
+        raise e
 
 
 if __name__ == "__main__":
+    import argparse
+
     parser = argparse.ArgumentParser(description="CAMAGUI Database Migration CLI Tool")
     parser.add_argument("-f", "--file", type=str, default="Calculos_Camaronera.xlsx",
                         help="Path to the Excel file (default: Calculos_Camaronera.xlsx)")
@@ -301,13 +457,19 @@ if __name__ == "__main__":
                         help="Migrate Products and Prices")
     parser.add_argument("--cycles", action="store_true",
                         help="Migrate Precrías, Siembras, and Transfers")
+    parser.add_argument("--curves", action="store_true",
+                        help="Migrate Masterline feeding curves")
+    parser.add_argument("--curvename", type=str, default="Masterline",
+                        help="Name to assign to the feeding curve (default: 'Masterline')")
+    parser.add_argument("--logs", action="store_true",
+                        help="Migrate raw weekly pond logs (Inputs only)")
     parser.add_argument("--all", action="store_true",
                         help="Run ALL migration steps sequentially")
 
     args = parser.parse_args()
 
-    # If no arguments are passed, show the help menu
-    if not (args.ponds or args.prices or args.cycles or args.all):
+    # If no flags are passed, show the help menu automatically
+    if not any([args.ponds, args.prices, args.cycles, args.curves, args.logs, args.all]):
         parser.print_help()
     else:
         if args.all or args.ponds:
@@ -318,3 +480,9 @@ if __name__ == "__main__":
 
         if args.all or args.cycles:
             migrate_precria_and_siembras(args.file, farm_name="CAMAGUI")
+
+        if args.all or args.curves:
+            migrate_feeding_curves(args.file)
+
+        if args.all or args.logs:
+            migrate_weekly_logs(args.file)
