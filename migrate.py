@@ -438,6 +438,89 @@ def migrate_weekly_logs(file_path):
         raise e
 
 
+# --- STEP 6: MIGRATE HARVESTS (PESCAS) ---
+def migrate_harvests(file_path):
+    try:
+        print(f"\n[*] Reading harvest data from {file_path}...")
+        df_harvests = pd.read_excel(file_path, sheet_name="PESCA CAMAGUI")
+        df_harvests.columns = [re.sub(r'\s+', ' ', str(col)).strip() for col in df_harvests.columns]
+
+        with psycopg2.connect(DB_URL) as conn:
+            with conn.cursor() as cur:
+                print("Ingesting harvests...")
+
+                # Cache growout cycles by cycle_code
+                cur.execute("SELECT cycle_code, cycle_id FROM growout_cycles;")
+                cycle_map = {str(row[0]).strip(): row[1] for row in cur.fetchall()}
+
+                for _, row in df_harvests.iterrows():
+                    raw_harvest_code = row.get("PESCA ID#", row.get("PESCA ID"))
+                    if pd.isna(raw_harvest_code) or not str(raw_harvest_code).strip():
+                        continue
+                    harvest_code = str(raw_harvest_code).strip()
+
+                    raw_cycle = row.get("SIEMBRA ID#", row.get("SIEMBRA ID"))
+                    if pd.isna(raw_cycle) or not str(raw_cycle).strip():
+                        continue
+                    cycle_code = str(raw_cycle).strip()
+
+                    cycle_id = cycle_map.get(cycle_code)
+                    if not cycle_id:
+                        print(f"  [!] Skipping harvest '{harvest_code}': Siembra '{cycle_code}' not found in database.")
+                        continue
+
+                    harvest_date = clean_date(row.get("FECHA PESCA"))
+                    if not harvest_date:
+                        continue
+
+                    # Operational and settlement weights
+                    lbs_remitidas = clean_val(row.get("LIBRAS REMITIDAS"), float) or 0.0
+                    lbs_planta = clean_val(row.get("LIBRAS PESCADAS"), float) or 0.0
+                    avg_weight_g = clean_val(row.get("GRAMOS CAMARON"), float) or 0.0
+                    payment = clean_val(row.get("PAGO RECIBIDO"), float) or 0.0
+
+                    raw_plant = row.get("PLANTA")
+                    packing_plant = str(raw_plant).strip() if pd.notna(raw_plant) and str(raw_plant).strip() else None
+
+                    # Parse new TIPO column: map FINAL, REPANO, RALEO to enum
+                    raw_type = str(row.get("TIPO", "")).strip().lower()
+                    if raw_type in ["raleo", "repano", "final"]:
+                        harvest_type = raw_type
+                    else:
+                        harvest_type = "final"
+
+                    cur.execute("""
+                        INSERT INTO harvests (
+                            cycle_id, harvest_code, harvest_date, harvest_type,
+                            lbs_remitidas, lbs_planta, average_weight_g,
+                            payment_received, packing_plant
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                        ON CONFLICT (harvest_code) DO UPDATE SET
+                            harvest_date = EXCLUDED.harvest_date,
+                            harvest_type = EXCLUDED.harvest_type,
+                            lbs_remitidas = EXCLUDED.lbs_remitidas,
+                            lbs_planta = EXCLUDED.lbs_planta,
+                            average_weight_g = EXCLUDED.average_weight_g,
+                            payment_received = EXCLUDED.payment_received,
+                            packing_plant = EXCLUDED.packing_plant;
+                    """, (
+                        cycle_id, harvest_code, harvest_date, harvest_type,
+                        lbs_remitidas, lbs_planta, avg_weight_g,
+                        payment, packing_plant
+                    ))
+
+            conn.commit()
+
+        print("✓ Harvests migrated successfully with TIPO classification.")
+
+    except Exception as e:
+        print(f"Error during harvest migration: {e}")
+        traceback.print_exc()
+        raise e
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -458,11 +541,13 @@ if __name__ == "__main__":
                         help="Migrate raw weekly pond logs (Inputs only)")
     parser.add_argument("--all", action="store_true",
                         help="Run ALL migration steps sequentially")
+    parser.add_argument("--harvests", action="store_true",
+                        help="Migrate Harvest (Pesca) logs")
 
     args = parser.parse_args()
 
     # If no flags are passed, show the help menu automatically
-    if not any([args.ponds, args.prices, args.cycles, args.curves, args.logs, args.all]):
+    if not any([args.ponds, args.prices, args.cycles, args.curves, args.logs, args.harvests, args.all]):
         parser.print_help()
     else:
         if args.all or args.ponds:
@@ -479,3 +564,6 @@ if __name__ == "__main__":
 
         if args.all or args.logs:
             migrate_weekly_logs(args.file)
+
+        if args.all or args.harvests:
+            migrate_harvests(args.file)

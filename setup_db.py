@@ -180,6 +180,34 @@ def create_tables():
             );
         """)
 
+        print("Creating harvest logs table...")
+        cur.execute("""
+            DO $$ BEGIN
+                CREATE TYPE harvest_type_enum AS ENUM ('raleo', 'final', 'repano');
+            EXCEPTION
+                WHEN duplicate_object THEN null;
+            END $$;
+
+            CREATE TABLE harvests (
+                harvest_id SERIAL PRIMARY KEY,
+                cycle_id INT NOT NULL REFERENCES growout_cycles(cycle_id) ON DELETE CASCADE,
+                harvest_code VARCHAR(50) UNIQUE NOT NULL,
+                harvest_date DATE NOT NULL,
+                harvest_type harvest_type_enum NOT NULL DEFAULT 'final',
+    
+                -- Weight Accounting
+                lbs_remitidas NUMERIC(10, 2) NOT NULL,    -- Weighed at farm harvest
+                lbs_planta NUMERIC(10, 2) NOT NULL,       -- Liquidated by processing plant
+                average_weight_g NUMERIC(6, 2) NOT NULL,  -- Gramaje promedio
+    
+                -- Financial Settlement
+                payment_received NUMERIC(12, 2) NOT NULL,
+                packing_plant VARCHAR(100),
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
         conn.commit()
         cur.close()
         conn.close()
