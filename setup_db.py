@@ -26,6 +26,7 @@ def create_tables():
             DROP TABLE IF EXISTS ponds CASCADE;
             DROP TABLE IF EXISTS farms CASCADE;
             DROP TABLE IF EXISTS organizations CASCADE;
+            DROP TABLE IF EXISTS harvests CASCADE;
         """)
 
         print("Creating core enterprise tables...")
@@ -133,8 +134,15 @@ def create_tables():
                 batch_code VARCHAR(50) UNIQUE NOT NULL,
                 start_date DATE NOT NULL,
                 initial_animals INT NOT NULL,
+                
+                -- New operational costs
+                larvae_cost NUMERIC(10, 2) DEFAULT 0.0,
+                ground_transport_cost NUMERIC(10, 2) DEFAULT 0.0,
+                sea_transport_cost NUMERIC(10, 2) DEFAULT 0.0,
+                
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+                
 
             CREATE TABLE precria_feed_applications (
                 feed_app_id SERIAL PRIMARY KEY,
