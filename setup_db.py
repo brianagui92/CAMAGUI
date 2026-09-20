@@ -109,39 +109,7 @@ def create_tables():
 
         print("Creating nursery (precría) and growout tracking tables...")
         cur.execute("""
-            CREATE TABLE larvae_providers (
-                provider_id SERIAL PRIMARY KEY,
-                name VARCHAR(150) NOT NULL UNIQUE,
-                contact_info VARCHAR(200),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE precria_batches (
-                precria_batch_id SERIAL PRIMARY KEY,
-                batch_code VARCHAR(50) NOT NULL UNIQUE,
-                farm_id INT NOT NULL REFERENCES farms(farm_id) ON DELETE CASCADE,
-                pond_id INT NOT NULL REFERENCES ponds(pond_id) ON DELETE CASCADE,
-                provider_id INT REFERENCES larvae_providers(provider_id) ON DELETE SET NULL,
-                initial_pl_age INT,
-                pl_per_gram NUMERIC(8, 2),
-                stocked_animals INT NOT NULL,
-                stocking_date DATE NOT NULL,
-                transfer_date DATE,
-                days INT,
-                final_weight_g NUMERIC(5, 2),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE precria_feed_applications (
-                application_id SERIAL PRIMARY KEY,
-                precria_batch_id INT NOT NULL REFERENCES precria_batches(precria_batch_id) ON DELETE CASCADE,
-                product_id INT REFERENCES products(product_id),
-                raw_product_name VARCHAR(150),
-                quantity_kg NUMERIC(10, 2) NOT NULL,
-                cost NUMERIC(10, 2) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
+        
             CREATE TABLE growout_cycles (
                 cycle_id SERIAL PRIMARY KEY,
                 cycle_code VARCHAR(50) NOT NULL UNIQUE,
@@ -151,18 +119,47 @@ def create_tables():
                 initial_weight_g NUMERIC(5, 2),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+                
+            CREATE TABLE larvae_providers (
+                provider_id SERIAL PRIMARY KEY,
+                name VARCHAR(150) NOT NULL UNIQUE,
+                contact_info VARCHAR(200),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE precria_batches (
+                precria_batch_id SERIAL PRIMARY KEY,
+                farm_id INT NOT NULL REFERENCES farms(farm_id) ON DELETE CASCADE,
+                batch_code VARCHAR(50) UNIQUE NOT NULL,
+                start_date DATE NOT NULL,
+                initial_animals INT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE precria_feed_applications (
+                feed_app_id SERIAL PRIMARY KEY,
+                precria_batch_id INT NOT NULL REFERENCES precria_batches(precria_batch_id) ON DELETE CASCADE,
+                raw_product_name VARCHAR(150),
+                quantity_kg NUMERIC(10, 2),
+                cost NUMERIC(10, 2),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
             CREATE TABLE precria_transfers (
                 transfer_id SERIAL PRIMARY KEY,
                 precria_batch_id INT NOT NULL REFERENCES precria_batches(precria_batch_id) ON DELETE CASCADE,
                 cycle_id INT NOT NULL REFERENCES growout_cycles(cycle_id) ON DELETE CASCADE,
-                transferred_animals INT NOT NULL,
-                prorated_feed_kg NUMERIC(10, 2),
-                prorated_feed_cost NUMERIC(10, 2),
-                transfer_date DATE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT unique_batch_cycle_transfer UNIQUE (precria_batch_id, cycle_id)
+    
+                -- Physical facts only (no prorated calculations)
+                transfer_date DATE NOT NULL,
+                animals_transferred INT NOT NULL,
+                transfer_weight_g NUMERIC(10, 3), 
+    
+                CONSTRAINT unique_batch_cycle UNIQUE (precria_batch_id, cycle_id),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+
         """)
 
         print("Creating weekly logs table...")

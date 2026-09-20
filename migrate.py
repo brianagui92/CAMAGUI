@@ -147,14 +147,16 @@ def migrate_products_and_prices(file_path):
         traceback.print_exc()
         raise e
 
-# --- STEP 3: MIGRATE PRECRIA AND SIEMBRAS ---
+
+
+# --- STEP 3: MIGRATE PRECRIA AND SIEMBRAS (RAW FACTS ONLY) ---
 def migrate_precria_and_siembras(file_path, farm_name="CAMAGUI"):
     try:
         print(f"\n[3/3] Reading PRECRIA and SIEMBRA sheets from {file_path}...")
         df_precria = pd.read_excel(file_path, sheet_name="PRECRIA CAMAGUI")
         df_siembra = pd.read_excel(file_path, sheet_name="SIEMB. CAMAGUI")
 
-        # THE MAGIC FIX: Strip all invisible newlines (Alt+Enter) and double spaces from Excel headers
+        # Strip all invisible newlines (Alt+Enter) and double spaces from Excel headers
         df_precria.columns = [re.sub(r'\s+', ' ', str(col)).strip() for col in df_precria.columns]
         df_siembra.columns = [re.sub(r'\s+', ' ', str(col)).strip() for col in df_siembra.columns]
 
@@ -196,32 +198,23 @@ def migrate_precria_and_siembras(file_path, farm_name="CAMAGUI"):
                         continue
                     batch_code = str(raw_batch).strip()
 
-                    pond_id = get_or_create_pond(row.get("PISC"))
-
                     stocked_animals = clean_val(row.get("ANIMALES SEMBRADOS"), int) or 0
                     stocking_date = clean_date(row.get("FECHA SIEMB."))
-                    transfer_date = clean_date(row.get("FECHA COSE."))
-                    days = clean_val(row.get("DIAS"), int)
-                    final_weight = clean_val(row.get("GRAM"), float)
 
                     # Upsert Batch
                     cur.execute("""
-                                INSERT INTO precria_batches (batch_code, farm_id, pond_id, stocked_animals,
-                                                             stocking_date, transfer_date, days, final_weight_g)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                                ON CONFLICT (batch_code) DO UPDATE SET stocked_animals = EXCLUDED.stocked_animals,
-                                                                       stocking_date   = EXCLUDED.stocking_date,
-                                                                       transfer_date   = EXCLUDED.transfer_date,
-                                                                       days            = EXCLUDED.days,
-                                                                       final_weight_g  = EXCLUDED.final_weight_g
+                                INSERT INTO precria_batches (farm_id, batch_code, start_date, initial_animals)
+                                VALUES (%s, %s, %s, %s)
+                                ON CONFLICT (batch_code) DO UPDATE SET start_date      = EXCLUDED.start_date,
+                                                                       initial_animals = EXCLUDED.initial_animals
                                 RETURNING precria_batch_id;
-                                """, (batch_code, farm_id, pond_id, stocked_animals, stocking_date, transfer_date, days,
-                                      final_weight))
+                                """, (farm_id, batch_code, stocking_date, stocked_animals))
+
                     p_batch_id = cur.fetchone()[0]
                     batch_id_map[batch_code] = p_batch_id
 
+                    # Restore your original feed application loop (Raw facts)
                     cur.execute("DELETE FROM precria_feed_applications WHERE precria_batch_id = %s;", (p_batch_id,))
-
                     for idx in range(1, 5):
                         kg = clean_val(row.get(f"BALANCEADO #{idx} (Kg)"))
                         feed_name = row.get(f"NOMBRE BALANC. #{idx}")
@@ -248,7 +241,6 @@ def migrate_precria_and_siembras(file_path, farm_name="CAMAGUI"):
                     cycle_code = str(raw_cycle).strip()
 
                     pond_id = get_or_create_pond(row.get("PISCINA"))
-
                     stocking_date = clean_date(row.get("FECHA SIEMB."))
                     init_weight = clean_val(row.get("PESO DE SIEMBRA"), float)
 
@@ -259,10 +251,11 @@ def migrate_precria_and_siembras(file_path, farm_name="CAMAGUI"):
                                                                        initial_weight_g = EXCLUDED.initial_weight_g
                                 RETURNING cycle_id;
                                 """, (cycle_code, farm_id, pond_id, stocking_date, init_weight))
+
                     cycle_id_map[cycle_code] = cur.fetchone()[0]
 
                 # -------------------------------------------------------------
-                # 3C. Precría Transfers
+                # 3C. Precría Transfers (Raw Physical Facts)
                 # -------------------------------------------------------------
                 print("Linking precria-to-siembra transfers...")
                 for _, row in df_siembra.iterrows():
@@ -274,18 +267,17 @@ def migrate_precria_and_siembras(file_path, farm_name="CAMAGUI"):
 
                     if c_id and b_id:
                         animals = clean_val(row.get("ANIMALES"), int) or 0
-                        prorated_kg = clean_val(row.get("PRECRIA BALANCEADO"), float)
-                        prorated_cost = clean_val(row.get("GASTO BALAN."), float)
                         t_date = clean_date(row.get("FECHA SIEMB."))
+                        transfer_weight = clean_val(row.get("PESO DE SIEMBRA"), float)
 
                         cur.execute("""
-                                    INSERT INTO precria_transfers (precria_batch_id, cycle_id, transferred_animals,
-                                                                   prorated_feed_kg, prorated_feed_cost, transfer_date)
-                                    VALUES (%s, %s, %s, %s, %s, %s)
-                                    ON CONFLICT (precria_batch_id, cycle_id) DO UPDATE SET transferred_animals = EXCLUDED.transferred_animals,
-                                                                                           prorated_feed_kg    = EXCLUDED.prorated_feed_kg,
-                                                                                           prorated_feed_cost  = EXCLUDED.prorated_feed_cost;
-                                    """, (b_id, c_id, animals, prorated_kg, prorated_cost, t_date))
+                                    INSERT INTO precria_transfers (precria_batch_id, cycle_id, transfer_date,
+                                                                   animals_transferred, transfer_weight_g)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                    ON CONFLICT (precria_batch_id, cycle_id) DO UPDATE SET transfer_date       = EXCLUDED.transfer_date,
+                                                                                           animals_transferred = EXCLUDED.animals_transferred,
+                                                                                           transfer_weight_g   = EXCLUDED.transfer_weight_g;
+                                    """, (b_id, c_id, t_date, animals, transfer_weight))
 
             conn.commit()
 
@@ -295,6 +287,7 @@ def migrate_precria_and_siembras(file_path, farm_name="CAMAGUI"):
         print(f"Error during linked migration: {e}")
         traceback.print_exc()
         raise e
+
 
 
 # --- STEP 4: MIGRATE FEEDING CURVES ---
