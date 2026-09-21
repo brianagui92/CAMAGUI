@@ -368,7 +368,7 @@ def migrate_weekly_logs(file_path):
 
         with psycopg2.connect(DB_URL) as conn:
             with conn.cursor() as cur:
-                print("Ingesting raw facts from CAMAGUI DATA UNIFICADA...")
+                print("Ingesting raw facts from CAMAGUI DATA UNIFICADA using bulk insert...")
 
                 # Cache Cycles
                 cur.execute("SELECT cycle_code, cycle_id FROM growout_cycles;")
@@ -387,7 +387,6 @@ def migrate_weekly_logs(file_path):
 
                     if lookup_code not in product_map:
                         print(f"  [!] Auto-creating missing feed product by code: '{clean_code}'")
-                        # If auto-created, we just set the name and code to be identical
                         cur.execute("""
                                     INSERT INTO products (name, product_code, category, base_unit, package_weight_kg)
                                     VALUES (%s, %s, 'feed', 'kg', 25.0)
@@ -396,6 +395,9 @@ def migrate_weekly_logs(file_path):
                         product_map[lookup_code] = cur.fetchone()[0]
 
                     return product_map[lookup_code]
+
+                # 1. Prepare a list to hold all the rows
+                records_to_insert = []
 
                 for _, row in df_logs.iterrows():
                     raw_cycle = row.get("SIEMBRA ID #")
@@ -420,15 +422,29 @@ def migrate_weekly_logs(file_path):
                     # Relational Product Lookup
                     product_id = get_or_create_product(row.get("NOMBRE BALANCEAD."))
 
-                    cur.execute("""
-                                INSERT INTO weekly_pond_logs (cycle_id, log_date, ultimo_tope_kg, feed_consumed_kg,
-                                                              product_id, actual_weight_g)
-                                VALUES (%s, %s, %s, %s, %s, %s)
-                                ON CONFLICT (cycle_id, log_date) DO UPDATE SET ultimo_tope_kg   = EXCLUDED.ultimo_tope_kg,
-                                                                               feed_consumed_kg = EXCLUDED.feed_consumed_kg,
-                                                                               product_id       = EXCLUDED.product_id,
-                                                                               actual_weight_g  = EXCLUDED.actual_weight_g;
-                                """, (cycle_id, log_date, ultimo_tope, consumo, product_id, peso_actual))
+                    # 2. Append the tuple to our list instead of executing one-by-one!
+                    records_to_insert.append((
+                        cycle_id, log_date, ultimo_tope, consumo, product_id, peso_actual
+                    ))
+
+                # 3. Perform the bulk insert if we have records
+                if records_to_insert:
+                    print(f"  -> Bulk inserting {len(records_to_insert)} records into Supabase...")
+
+                    bulk_insert_query = (
+                        "INSERT INTO weekly_pond_logs ("
+                        "   cycle_id, log_date, ultimo_tope_kg, feed_consumed_kg, product_id, actual_weight_g"
+                        ") "
+                        "VALUES %s "
+                        "ON CONFLICT (cycle_id, log_date) DO UPDATE SET "
+                        "   ultimo_tope_kg   = EXCLUDED.ultimo_tope_kg, "
+                        "   feed_consumed_kg = EXCLUDED.feed_consumed_kg, "
+                        "   product_id       = EXCLUDED.product_id, "
+                        "   actual_weight_g  = EXCLUDED.actual_weight_g;"
+                    )
+                    
+                    # execute_values automatically chunks the data and handles string formatting
+                    execute_values(cur, bulk_insert_query, records_to_insert, page_size=1000)
 
         print("✓ Raw weekly pond logs migrated successfully.")
 
@@ -447,11 +463,14 @@ def migrate_harvests(file_path):
 
         with psycopg2.connect(DB_URL) as conn:
             with conn.cursor() as cur:
-                print("Ingesting harvests...")
+                print("Ingesting harvests using bulk insert...")
 
                 # Cache growout cycles by cycle_code
                 cur.execute("SELECT cycle_code, cycle_id FROM growout_cycles;")
                 cycle_map = {str(row[0]).strip(): row[1] for row in cur.fetchall()}
+
+                # 1. Start a DICTIONARY instead of a LIST to naturally overwrite duplicate Excel rows
+                records_dict = {}
 
                 for _, row in df_harvests.iterrows():
                     raw_harvest_code = row.get("PESCA ID#", row.get("PESCA ID"))
@@ -489,31 +508,40 @@ def migrate_harvests(file_path):
                     else:
                         harvest_type = "final"
 
-                    cur.execute("""
-                        INSERT INTO harvests (
-                            cycle_id, harvest_code, harvest_date, harvest_type,
-                            lbs_remitidas, lbs_planta, average_weight_g,
-                            payment_received, packing_plant
-                        ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s
-                        )
-                        ON CONFLICT (harvest_code) DO UPDATE SET
-                            harvest_date = EXCLUDED.harvest_date,
-                            harvest_type = EXCLUDED.harvest_type,
-                            lbs_remitidas = EXCLUDED.lbs_remitidas,
-                            lbs_planta = EXCLUDED.lbs_planta,
-                            average_weight_g = EXCLUDED.average_weight_g,
-                            payment_received = EXCLUDED.payment_received,
-                            packing_plant = EXCLUDED.packing_plant;
-                    """, (
+                    # 2. Insert into dictionary. If the harvest_code already exists, it gets securely overwritten!
+                    records_dict[harvest_code] = (
                         cycle_id, harvest_code, harvest_date, harvest_type,
                         lbs_remitidas, lbs_planta, avg_weight_g,
                         payment, packing_plant
-                    ))
+                    )
+
+                # 3. Pull the deduplicated tuples out of the dictionary map
+                records_to_insert = list(records_dict.values())
+
+                if records_to_insert:
+                    print(f"  -> Bulk inserting {len(records_to_insert)} deduplicated harvest records into Supabase...")
+
+                    bulk_insert_query = (
+                        "INSERT INTO harvests ("
+                        "   cycle_id, harvest_code, harvest_date, harvest_type, "
+                        "   lbs_remitidas, lbs_planta, average_weight_g, "
+                        "   payment_received, packing_plant"
+                        ") VALUES %s "
+                        "ON CONFLICT (harvest_code) DO UPDATE SET "
+                        "   harvest_date = EXCLUDED.harvest_date, "
+                        "   harvest_type = EXCLUDED.harvest_type, "
+                        "   lbs_remitidas = EXCLUDED.lbs_remitidas, "
+                        "   lbs_planta = EXCLUDED.lbs_planta, "
+                        "   average_weight_g = EXCLUDED.average_weight_g, "
+                        "   payment_received = EXCLUDED.payment_received, "
+                        "   packing_plant = EXCLUDED.packing_plant;"
+                    )
+
+                    execute_values(cur, bulk_insert_query, records_to_insert, page_size=1000)
 
             conn.commit()
 
-        print("✓ Harvests migrated successfully with TIPO classification.")
+        print("✓ Harvests migrated successfully with deduplication.")
 
     except Exception as e:
         print(f"Error during harvest migration: {e}")
