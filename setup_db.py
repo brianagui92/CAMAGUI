@@ -141,7 +141,7 @@ def create_operation_tables(cur):
                     start_date            DATE               NOT NULL,
                     initial_animals       INT                NOT NULL,
 
-                    -- New operational costs
+                    -- Financial Costs Restored
                     larvae_cost           NUMERIC(10, 2) DEFAULT 0.0,
                     ground_transport_cost NUMERIC(10, 2) DEFAULT 0.0,
                     sea_transport_cost    NUMERIC(10, 2) DEFAULT 0.0,
@@ -235,6 +235,177 @@ def create_harvest_tables(cur):
                 """)
 
 
+def create_analytical_views(cur):
+    print("Rebuilding analytical views...")
+    
+    # ==========================================
+    # 1. PRECRIA PERFORMANCE & FINANCIAL VIEW
+    # ==========================================
+    cur.execute("""
+                CREATE OR REPLACE VIEW vw_precria_performance AS
+                WITH feed_totals AS (
+                    SELECT 
+                        precria_batch_id,
+                        SUM(quantity_kg) AS total_feed_kg,
+                        SUM(cost) AS total_feed_cost
+                    FROM precria_feed_applications
+                    GROUP BY precria_batch_id
+                ),
+                transfer_totals AS (
+                    SELECT 
+                        precria_batch_id,
+                        SUM(animals_transferred) AS total_animals_transferred,
+                        MAX(transfer_date) AS last_transfer_date,
+                        -- We calculate the weighted average transfer weight (peso de siembra)
+                        SUM(animals_transferred * transfer_weight_g) / NULLIF(SUM(animals_transferred), 0) AS avg_transfer_weight_g,
+                        -- Total biomass out in kg
+                        SUM(animals_transferred * transfer_weight_g) / 1000 AS biomass_transferred_kg
+                    FROM precria_transfers
+                    GROUP BY precria_batch_id
+                )
+                SELECT 
+                    pb.precria_batch_id,
+                    pb.batch_code,
+                    f.name AS farm_name,
+                    pb.start_date,
+                    pb.initial_animals AS stocked_larvae,
+                    
+                    tt.total_animals_transferred AS juveniles_transferred,
+                    (tt.last_transfer_date - pb.start_date) AS days_in_nursery,
+                    
+                    -- Biological Performance
+                    (tt.total_animals_transferred::numeric / NULLIF(pb.initial_animals, 0)) * 100 AS survival_rate_pct,
+                    tt.avg_transfer_weight_g,
+                    COALESCE(ft.total_feed_kg, 0) AS total_feed_kg,
+                    -- FCR (Feed Conversion Ratio) for the nursery phase
+                    COALESCE(ft.total_feed_kg, 0) / NULLIF(tt.biomass_transferred_kg, 0) AS fcr,
+                    
+                    -- Financials
+                    pb.larvae_cost,
+                    (pb.ground_transport_cost + pb.sea_transport_cost) AS total_transport_cost,
+                    COALESCE(ft.total_feed_cost, 0) AS total_feed_cost,
+                    
+                    (pb.larvae_cost + pb.ground_transport_cost + pb.sea_transport_cost + COALESCE(ft.total_feed_cost, 0)) AS total_batch_cost,
+                    
+                    -- The ultimate industry metric: Unit Cost to transfer to Growout
+                    (pb.larvae_cost + pb.ground_transport_cost + pb.sea_transport_cost + COALESCE(ft.total_feed_cost, 0)) / 
+                        NULLIF(tt.total_animals_transferred / 1000.0, 0) AS cost_per_thousand_juveniles
+                        
+                FROM precria_batches pb
+                JOIN farms f ON pb.farm_id = f.farm_id
+                LEFT JOIN feed_totals ft ON pb.precria_batch_id = ft.precria_batch_id
+                LEFT JOIN transfer_totals tt ON pb.precria_batch_id = tt.precria_batch_id;
+                """)
+
+    # ==========================================
+    # 2. GROWOUT BIOLOGICAL PERFORMANCE VIEW
+    # ==========================================
+    cur.execute("""
+                CREATE OR REPLACE VIEW vw_cycle_performance_bio AS
+                WITH transfer_totals AS (
+                    SELECT cycle_id, SUM(animals_transferred) as total_animals_transferred
+                    FROM precria_transfers
+                    GROUP BY cycle_id
+                ),
+                
+                -- CTE 1: Calculate the absolute total feed consumed by each entire batch
+                batch_feed AS (
+                    SELECT precria_batch_id, SUM(quantity_kg) as total_feed_kg
+                    FROM precria_feed_applications
+                    GROUP BY precria_batch_id
+                ),
+                
+                -- CTE 2: Calculate the absolute total animals that SURVIVED and were transferred out of the batch
+                batch_transfer_totals AS (
+                    SELECT precria_batch_id, SUM(animals_transferred) as total_outbound_animals
+                    FROM precria_transfers
+                    GROUP BY precria_batch_id
+                ),
+                
+                -- CTE 3: Safely assign the prorated feed to the growout cycle
+                precria_feed_totals AS (
+                    SELECT 
+                        pt.cycle_id,
+                        -- Prorate by dividing this cycle's animals by the total animals successfully transferred out of the batch
+                        SUM(bf.total_feed_kg * (pt.animals_transferred::numeric / NULLIF(btt.total_outbound_animals, 0))) AS precria_feed_kg
+                    FROM precria_transfers pt
+                    JOIN batch_feed bf ON pt.precria_batch_id = bf.precria_batch_id
+                    JOIN batch_transfer_totals btt ON pt.precria_batch_id = btt.precria_batch_id
+                    GROUP BY pt.cycle_id
+                ),
+                
+                growout_feed_totals AS (
+                    SELECT 
+                        cycle_id, 
+                        SUM(feed_consumed_kg) AS growout_feed_kg,
+                        MODE() WITHIN GROUP (ORDER BY product_id) AS top_feed_product_id
+                    FROM weekly_pond_logs
+                    GROUP BY cycle_id
+                ),
+                
+                harvest_totals AS (
+                    SELECT 
+                        cycle_id,
+                        SUM(lbs_remitidas) AS total_lbs_remitidas,
+                        MAX(harvest_date) AS last_harvest_date,
+                        SUM((lbs_remitidas * 453.592) / NULLIF(average_weight_g, 0)) AS estimated_animals_harvested,
+                        SUM(lbs_remitidas * average_weight_g) / NULLIF(SUM(lbs_remitidas), 0) AS weighted_avg_harvest_weight_g
+                    FROM harvests
+                    GROUP BY cycle_id
+                ),
+                
+                final_harvest_data AS (
+                    SELECT DISTINCT ON (cycle_id) 
+                        cycle_id, 
+                        average_weight_g AS final_harvest_weight_g, 
+                        harvest_date AS date_of_final
+                    FROM harvests
+                    WHERE harvest_type = 'final'
+                    ORDER BY cycle_id, harvest_date DESC
+                )
+                
+                SELECT 
+                    gc.cycle_id,
+                    gc.cycle_code,
+                    p.pond_name,
+                    gc.stocking_date,
+                    tt.total_animals_transferred,
+                    (tt.total_animals_transferred / p.hectares) AS stocking_density_ha,
+                    COALESCE(pf.precria_feed_kg, 0) + COALESCE(gf.growout_feed_kg, 0) AS total_feed_consumed_kg,
+                    prod.name AS most_used_feed_type,
+                    
+                    ht.total_lbs_remitidas,
+                    (ht.total_lbs_remitidas / p.hectares) AS lbs_harvested_per_ha,
+                    
+                    ht.weighted_avg_harvest_weight_g,
+                    fhd.final_harvest_weight_g,
+                    fhd.date_of_final,
+                    ht.last_harvest_date,
+                    
+                    (ht.last_harvest_date - gc.stocking_date) AS total_days_of_cycle,
+                    
+                    -- Survival Rate %
+                    (ht.estimated_animals_harvested / NULLIF(tt.total_animals_transferred, 0)) * 100 AS survival_rate_pct,
+                    
+                    -- FCR = Feed (kg) / Biomass Harvested (kg)
+                    (COALESCE(pf.precria_feed_kg, 0) + COALESCE(gf.growout_feed_kg, 0)) / 
+                        NULLIF(ht.total_lbs_remitidas * 0.453592, 0) AS fcr,
+                        
+                    -- Avg Weekly Growth (g/week) calculated up to 'final' harvest
+                    (fhd.final_harvest_weight_g - gc.initial_weight_g) / 
+                        NULLIF((fhd.date_of_final - gc.stocking_date) / 7.0, 0) AS avg_weekly_growth_g
+                        
+                FROM growout_cycles gc
+                JOIN ponds p ON gc.pond_id = p.pond_id
+                LEFT JOIN transfer_totals tt ON gc.cycle_id = tt.cycle_id
+                LEFT JOIN precria_feed_totals pf ON gc.cycle_id = pf.cycle_id
+                LEFT JOIN growout_feed_totals gf ON gc.cycle_id = gf.cycle_id
+                LEFT JOIN products prod ON gf.top_feed_product_id = prod.product_id
+                LEFT JOIN harvest_totals ht ON gc.cycle_id = ht.cycle_id
+                LEFT JOIN final_harvest_data fhd ON gc.cycle_id = fhd.cycle_id;
+                """)
+
+
 def main():
     parser = argparse.ArgumentParser(description="CAMAGUI Database Setup CLI Tool")
     parser.add_argument("--core", action="store_true", help="Rebuild core tables (organizations, farms, ponds)")
@@ -242,12 +413,13 @@ def main():
     parser.add_argument("--operations", action="store_true", help="Rebuild nursery and growout tracking tables")
     parser.add_argument("--logs", action="store_true", help="Rebuild weekly logs table")
     parser.add_argument("--harvests", action="store_true", help="Rebuild harvest logs table")
-    parser.add_argument("--all", action="store_true", help="Rebuild all database tables")
+    parser.add_argument("--analytics", action="store_true", help="Rebuild analytical SQL Views")
+    parser.add_argument("--all", action="store_true", help="Rebuild all database tables and views")
 
     args = parser.parse_args()
 
     # Automatically show help if no arguments provided
-    if not any([args.core, args.products, args.operations, args.logs, args.harvests, args.all]):
+    if not any([args.core, args.products, args.operations, args.logs, args.harvests, args.analytics, args.all]):
         parser.print_help()
         return
 
@@ -270,6 +442,9 @@ def main():
 
         if args.harvests or args.all:
             create_harvest_tables(cur)
+
+        if args.analytics or args.all:
+            create_analytical_views(cur)
 
         conn.commit()
         cur.close()
