@@ -15,11 +15,60 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
+try:
+    from supabase import create_client, Client
+    HAS_SUPABASE = True
+except ImportError:
+    HAS_SUPABASE = False
+
 # 1. Page Configuration
 st.set_page_config(page_title="CAMAGUI Dashboard", page_icon="🦐", layout="wide")
 
 # Load environment variables
 load_dotenv()
+
+# --- AUTHENTICATION LAYER ---
+if HAS_SUPABASE:
+    SB_URL = os.getenv("SUPABASE_URL")
+    SB_KEY = os.getenv("SUPABASE_KEY")
+    
+    if SB_URL and SB_KEY:
+        supabase_client: Client = create_client(SB_URL, SB_KEY)
+        
+        if 'auth_user' not in st.session_state:
+            st.session_state.auth_user = None
+            
+        if not st.session_state.auth_user:
+            st.title("🔒 CAMAGUI Security System")
+            st.write("Please authenticate to access the master dashboard.")
+            
+            with st.form("login_form"):
+                email = st.text_input("Email Address")
+                password = st.text_input("Password", type="password")
+                submitted = st.form_submit_button("Secure Login")
+                
+                if submitted:
+                    try:
+                        res = supabase_client.auth.sign_in_with_password({"email": email, "password": password})
+                        if res.user:
+                            st.session_state.auth_user = res.user
+                            st.rerun()
+                    except Exception as e:
+                        st.error("❌ Authentication Failed: Invalid email or password.")
+            
+            st.stop() # Halts the rendering of the dashboard if not logged in
+        else:
+            with st.sidebar:
+                st.write(f"👤 Logged in as: **{st.session_state.auth_user.email}**")
+                if st.button("Logout"):
+                    supabase_client.auth.sign_out()
+                    st.session_state.auth_user = None
+                    st.rerun()
+    else:
+        st.sidebar.warning("⚠️ Supabase API Keys missing. Running in open developer mode.")
+else:
+    st.sidebar.warning("⚠️ Supabase library not found. Running in open developer mode.")
+
 
 # 2. Database Connection Wrapper (HARDENED FOR FAILED TRANSACTIONS)
 def get_connection():
@@ -168,17 +217,38 @@ with tab1:
         with col4:
             st.text_area("Comments", height=120)
             if st.form_submit_button("Submit Log Update", type="primary"):
-                if s_prod != "(Select Feed)":
-                    cycle_id = int(active_cycles_df[active_cycles_df['pond_name'] == selected_pond].iloc[0]['cycle_id'])
-                    try:
-                        conn = get_connection()
-                        with conn.cursor() as cur:
-                            cur.execute("""INSERT INTO weekly_pond_logs (cycle_id, log_date, ultimo_tope_kg, feed_consumed_kg, product_id, actual_weight_g) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (cycle_id, log_date) DO UPDATE SET ultimo_tope_kg = EXCLUDED.ultimo_tope_kg, feed_consumed_kg = EXCLUDED.feed_consumed_kg, product_id = EXCLUDED.product_id, actual_weight_g = EXCLUDED.actual_weight_g;""", (cycle_id, log_dt, u_tope, feed_kg, product_mapping[s_prod], act_w))
-                        conn.commit()
-                        st.success("✅ Successfully logged data!")
-                        st.cache_data.clear()
-                    except Exception as e:
-                        st.error(f"❌ Failed. {e}")
+                
+                # Check Auth permissions before allowing write to DB!
+                if 'auth_user' in st.session_state and st.session_state.auth_user:
+                    # Allow operation
+                    if s_prod != "(Select Feed)":
+                        cycle_id = int(active_cycles_df[active_cycles_df['pond_name'] == selected_pond].iloc[0]['cycle_id'])
+                        try:
+                            conn = get_connection()
+                            with conn.cursor() as cur:
+                                cur.execute("""INSERT INTO weekly_pond_logs (cycle_id, log_date, ultimo_tope_kg, feed_consumed_kg, product_id, actual_weight_g) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (cycle_id, log_date) DO UPDATE SET ultimo_tope_kg = EXCLUDED.ultimo_tope_kg, feed_consumed_kg = EXCLUDED.feed_consumed_kg, product_id = EXCLUDED.product_id, actual_weight_g = EXCLUDED.actual_weight_g;""", (cycle_id, log_dt, u_tope, feed_kg, product_mapping[s_prod], act_w))
+                            conn.commit()
+                            st.success("✅ Successfully logged data!")
+                            st.cache_data.clear()
+                        except Exception as e:
+                            st.error(f"❌ Failed. {e}")
+                else:
+                    if not HAS_SUPABASE or not (SB_URL and SB_KEY):
+                        # Running strictly securely in dev mode
+                        st.warning("⚠️ Running in open dev mode. To secure data entry, deploy your Supabase Keys in .env")
+                        if s_prod != "(Select Feed)":
+                            cycle_id = int(active_cycles_df[active_cycles_df['pond_name'] == selected_pond].iloc[0]['cycle_id'])
+                            try:
+                                conn = get_connection()
+                                with conn.cursor() as cur:
+                                    cur.execute("""INSERT INTO weekly_pond_logs (cycle_id, log_date, ultimo_tope_kg, feed_consumed_kg, product_id, actual_weight_g) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (cycle_id, log_date) DO UPDATE SET ultimo_tope_kg = EXCLUDED.ultimo_tope_kg, feed_consumed_kg = EXCLUDED.feed_consumed_kg, product_id = EXCLUDED.product_id, actual_weight_g = EXCLUDED.actual_weight_g;""", (cycle_id, log_dt, u_tope, feed_kg, product_mapping[s_prod], act_w))
+                                conn.commit()
+                                st.success("✅ Successfully logged data in dev mode!")
+                                st.cache_data.clear()
+                            except Exception as e:
+                                st.error(f"❌ Failed. {e}")
+                    else:
+                        st.error("Authentication required to submit data.")
 
 with tab2:
     st.header("Empirical Growth Modeling")
@@ -220,7 +290,6 @@ with tab3:
         col_c, col_v1, col_v2 = st.columns([2, 1, 1])
         with col_c: selected_cycle_display = st.selectbox("Select Growout Cycle to Diagnose", cycle_df['display_name'])
         
-        # FIX: Updated Farm Standard Baseline Defaults (12% shock, 1.5% weekly)
         with col_v1: transfer_shock = st.slider("Precría Transfer Shock Loss (%)", min_value=0.0, max_value=30.0, value=12.0, step=0.5)
         with col_v2: weekly_mort = st.slider("Basal Weekly Mortality (%)", min_value=0.0, max_value=5.0, value=1.5, step=0.1)
         
