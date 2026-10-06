@@ -132,6 +132,31 @@ def load_active_cycles():
     """
     return pd.read_sql(query, conn)
 
+@st.cache_data(ttl=60)
+def load_camagui_ponds():
+    conn = get_connection()
+    query = """
+        SELECT p.pond_id, p.pond_name 
+        FROM ponds p JOIN farms f ON p.farm_id = f.farm_id 
+        WHERE f.name ILIKE '%camagui%'
+        ORDER BY p.pond_name;
+    """
+    return pd.read_sql(query, conn)
+
+@st.cache_data(ttl=60)
+def load_daily_feed_history():
+    try:
+        conn = get_connection()
+        query = """
+            SELECT dfl.feed_date as "Date", p.pond_name as "Pond", dfl.quantity_kg as "Kilos"
+            FROM daily_feed_logs dfl 
+            JOIN ponds p ON dfl.pond_id = p.pond_id
+            ORDER BY dfl.feed_date DESC, p.pond_name;
+        """
+        return pd.read_sql(query, conn)
+    except Exception:
+        return pd.DataFrame()
+
 @st.cache_data(ttl=600)
 def load_growth_curve_data():
     conn = get_connection()
@@ -177,7 +202,71 @@ def get_cycle_diagnostic_data(cycle_id):
 # --- START OF UI ---
 st.title("🦐 CAMAGUI Master Dashboard")
 
-tab1, tab2, tab3 = st.tabs(["📊 Performance & Operations", "🔬 Advanced Analytics", "🧬 Survival Diagnostics"])
+tab_daily, tab1, tab2, tab3 = st.tabs(["📝 Ingreso de Alimento Diario", "📊 Performance & Operations", "🔬 Advanced Analytics", "🧪 Survival Diagnostics"])
+
+with tab_daily:
+    st.header("📝 Ingreso Rápido de Alimento (Kilos)")
+    st.write("Seleccione la fecha e ingrese los kilos de alimento para cada piscina de CAMAGUI.")
+    
+    col_date, _ = st.columns([1, 3])
+    with col_date:
+        selected_date = st.date_input("Fecha de Alimentación", max_value=date.today())
+        
+    camagui_ponds = load_camagui_ponds()
+    if not camagui_ponds.empty:
+        # Create a dataframe for data entry
+        input_df = pd.DataFrame({
+            "Piscina": camagui_ponds['pond_name'].tolist(),
+            "Kilos": [0.0] * len(camagui_ponds),
+            "pond_id": camagui_ponds['pond_id'].tolist()
+        })
+        
+        st.write(f"**Ingrese datos para: {selected_date.strftime('%d/%m/%Y')}**")
+        edited_df = st.data_editor(
+            input_df[["Piscina", "Kilos"]],
+            column_config={
+                "Piscina": st.column_config.TextColumn("Piscina", disabled=True),
+                "Kilos": st.column_config.NumberColumn("Kilos de Alimento", min_value=0.0, format="%.1f")
+            },
+            hide_index=True,
+            num_rows="fixed",
+            key="feed_entry_grid"
+        )
+        
+        if st.button("Guardar Datos de Alimentación", type="primary"):
+            # Check Auth permissions
+            if 'auth_user' in st.session_state and st.session_state.auth_user or (not HAS_SUPABASE or not (SB_URL and SB_KEY)):
+                try:
+                    conn = get_connection()
+                    with conn.cursor() as cur:
+                        for i, row in edited_df.iterrows():
+                            kilos = float(row["Kilos"])
+                            if kilos > 0:
+                                pond_id = input_df.iloc[i]["pond_id"]
+                                cur.execute("""
+                                    INSERT INTO daily_feed_logs (pond_id, feed_date, quantity_kg) 
+                                    VALUES (%s, %s, %s) 
+                                    ON CONFLICT (pond_id, feed_date) 
+                                    DO UPDATE SET quantity_kg = EXCLUDED.quantity_kg;
+                                """, (int(pond_id), selected_date, kilos))
+                    conn.commit()
+                    st.success("✅ ¡Datos guardados exitosamente!")
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error al guardar: {e}")
+            else:
+                st.error("Authentication required to submit data.")
+    else:
+        st.warning("No se encontraron piscinas configuradas para CAMAGUI.")
+        
+    st.divider()
+    st.subheader("📚 Historial de Alimentación Diaria")
+    history_df = load_daily_feed_history()
+    if not history_df.empty:
+        st.dataframe(history_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No hay registros previos en la base de datos.")
 
 with tab1:
     st.markdown("Welcome to the unified analytics and data entry platform.")
@@ -282,7 +371,7 @@ with tab2:
         st.plotly_chart(fig2, use_container_width=True)
 
 with tab3:
-    st.header("🧬 Live Biomass & Survival Diagnostics")
+    st.header("🧪 Live Biomass & Survival Diagnostics")
     st.write("Visually align your theoretical mortality assumptions against factual harvests to retroactively discover true cycle survival.")
     
     cycle_df = load_cycle_dropdown()
