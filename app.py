@@ -148,7 +148,7 @@ def load_daily_feed_history():
     try:
         conn = get_connection()
         query = """
-            SELECT dfl.feed_date as "Date", p.pond_name as "Pond", dfl.quantity_kg as "Kilos"
+            SELECT dfl.log_id, dfl.feed_date as "Date", p.pond_name as "Pond", dfl.quantity_kg as "Kilos"
             FROM daily_feed_logs dfl 
             JOIN ponds p ON dfl.pond_id = p.pond_id
             ORDER BY dfl.feed_date DESC, p.pond_name;
@@ -264,7 +264,46 @@ with tab_daily:
     st.subheader("📚 Historial de Alimentación Diaria")
     history_df = load_daily_feed_history()
     if not history_df.empty:
-        st.dataframe(history_df, use_container_width=True, hide_index=True)
+        st.write("Puedes editar los kilos directamente en la tabla o seleccionar la fila a la izquierda y presionar la tecla **Suprimir/Borrar** para eliminar un registro equivocado.")
+        with st.form("history_form"):
+            edited_history = st.data_editor(
+                history_df,
+                column_config={
+                    "log_id": None, 
+                    "Date": st.column_config.DateColumn("Fecha", disabled=True),
+                    "Pond": st.column_config.TextColumn("Piscina", disabled=True),
+                    "Kilos": st.column_config.NumberColumn("Kilos de Alimento", min_value=0.0)
+                },
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                key="history_editor"
+            )
+            submit_edits = st.form_submit_button("Guardar Cambios del Historial")
+            
+            if submit_edits:
+                changes = st.session_state["history_editor"]
+                if changes.get("edited_rows") or changes.get("deleted_rows"):
+                    try:
+                        conn = get_connection()
+                        with conn.cursor() as cur:
+                            for row_idx_str, cols in changes.get("edited_rows", {}).items():
+                                if "Kilos" in cols:
+                                    row_idx = int(row_idx_str)
+                                    log_id = int(history_df.iloc[row_idx]["log_id"])
+                                    new_kilos = float(cols["Kilos"])
+                                    cur.execute("UPDATE daily_feed_logs SET quantity_kg = %s WHERE log_id = %s", (new_kilos, log_id))
+                            
+                            for row_idx in changes.get("deleted_rows", []):
+                                log_id = int(history_df.iloc[row_idx]["log_id"])
+                                cur.execute("DELETE FROM daily_feed_logs WHERE log_id = %s", (log_id,))
+                                
+                        conn.commit()
+                        st.success("✅ ¡Historial actualizado!")
+                        st.cache_data.clear()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Error al actualizar: {e}")
     else:
         st.info("No hay registros previos en la base de datos.")
 
