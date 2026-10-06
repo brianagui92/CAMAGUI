@@ -148,7 +148,9 @@ def load_daily_feed_history():
     try:
         conn = get_connection()
         query = """
-            SELECT dfl.log_id, dfl.feed_date as "Date", p.pond_name as "Pond", dfl.quantity_kg as "Kilos"
+            SELECT dfl.log_id, dfl.feed_date as "Date", p.pond_name as "Pond", 
+            dfl.quantity_kg as "Kilos", dfl.do_am as "DO AM", dfl.do_sat_am as "Sat AM %", 
+            dfl.temp_am as "Temp AM", dfl.do_pm as "DO PM", dfl.do_sat_pm as "Sat PM %", dfl.temp_pm as "Temp PM"
             FROM daily_feed_logs dfl 
             JOIN ponds p ON dfl.pond_id = p.pond_id
             ORDER BY dfl.feed_date DESC, p.pond_name;
@@ -205,50 +207,73 @@ st.title("🦐 CAMAGUI Master Dashboard")
 tab_daily, tab1, tab2, tab3 = st.tabs(["📝 Ingreso de Alimento Diario", "📊 Performance & Operations", "🔬 Advanced Analytics", "🧪 Survival Diagnostics"])
 
 with tab_daily:
-    st.header("📝 Ingreso Rápido de Alimento (Kilos)")
-    st.write("Seleccione la fecha e ingrese los kilos de alimento para cada piscina de CAMAGUI.")
+    st.header("📝 Ingreso Rápido Diario (Alimento y Parámetros)")
+    st.write("Ingrese los kilos de alimento y las lecturas de calidad de agua (AM y PM) para cada piscina.")
     
     col_date, _ = st.columns([1, 3])
     with col_date:
-        selected_date = st.date_input("Fecha de Alimentación", max_value=date.today())
+        selected_date = st.date_input("Fecha de Registro", max_value=date.today())
         
     camagui_ponds = load_camagui_ponds()
     if not camagui_ponds.empty:
-        # Create a dataframe for data entry
         input_df = pd.DataFrame({
             "Piscina": camagui_ponds['pond_name'].tolist(),
             "Kilos": [0.0] * len(camagui_ponds),
+            "DO AM": [None] * len(camagui_ponds),
+            "Sat AM %": [None] * len(camagui_ponds),
+            "Temp AM": [None] * len(camagui_ponds),
+            "DO PM": [None] * len(camagui_ponds),
+            "Sat PM %": [None] * len(camagui_ponds),
+            "Temp PM": [None] * len(camagui_ponds),
             "pond_id": camagui_ponds['pond_id'].tolist()
         })
         
         st.write(f"**Ingrese datos para: {selected_date.strftime('%d/%m/%Y')}**")
         edited_df = st.data_editor(
-            input_df[["Piscina", "Kilos"]],
+            input_df[["Piscina", "Kilos", "DO AM", "Sat AM %", "Temp AM", "DO PM", "Sat PM %", "Temp PM"]],
             column_config={
                 "Piscina": st.column_config.TextColumn("Piscina", disabled=True),
-                "Kilos": st.column_config.NumberColumn("Kilos de Alimento", min_value=0.0, format="%.1f")
+                "Kilos": st.column_config.NumberColumn("Kilos Alimento", min_value=0.0, format="%.1f"),
+                "DO AM": st.column_config.NumberColumn("Oxígeno AM", min_value=0.0, format="%.2f"),
+                "Sat AM %": st.column_config.NumberColumn("Sat AM %", min_value=0.0, format="%.1f"),
+                "Temp AM": st.column_config.NumberColumn("Temp AM", min_value=0.0, format="%.1f"),
+                "DO PM": st.column_config.NumberColumn("Oxígeno PM", min_value=0.0, format="%.2f"),
+                "Sat PM %": st.column_config.NumberColumn("Sat PM %", min_value=0.0, format="%.1f"),
+                "Temp PM": st.column_config.NumberColumn("Temp PM", min_value=0.0, format="%.1f")
             },
             hide_index=True,
             num_rows="fixed",
-            key="feed_entry_grid"
+            key="feed_entry_grid",
+            use_container_width=True
         )
         
-        if st.button("Guardar Datos de Alimentación", type="primary"):
-            # Check Auth permissions
+        if st.button("Guardar Datos del Día", type="primary"):
             if 'auth_user' in st.session_state and st.session_state.auth_user or (not HAS_SUPABASE or not (SB_URL and SB_KEY)):
                 try:
                     conn = get_connection()
                     with conn.cursor() as cur:
                         for i, row in edited_df.iterrows():
-                            kilos = float(row["Kilos"])
-                            if kilos > 0:
+                            kilos = row["Kilos"] if pd.notnull(row["Kilos"]) else 0.0
+                            if kilos > 0 or pd.notnull(row["DO AM"]) or pd.notnull(row["DO PM"]):
                                 pond_id = input_df.iloc[i]["pond_id"]
-                                cur.execute("""
-                                    INSERT INTO daily_feed_logs (pond_id, feed_date, quantity_kg) 
-                                    VALUES (%s, %s, %s) 
+                                cur.execute('''
+                                    INSERT INTO daily_feed_logs 
+                                    (pond_id, feed_date, quantity_kg, do_am, do_sat_am, temp_am, do_pm, do_sat_pm, temp_pm) 
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) 
                                     ON CONFLICT (pond_id, feed_date) 
-                                    DO UPDATE SET quantity_kg = EXCLUDED.quantity_kg;
-                                """, (int(pond_id), selected_date, kilos))
+                                    DO UPDATE SET 
+                                        quantity_kg = EXCLUDED.quantity_kg,
+                                        do_am = EXCLUDED.do_am, do_sat_am = EXCLUDED.do_sat_am, temp_am = EXCLUDED.temp_am,
+                                        do_pm = EXCLUDED.do_pm, do_sat_pm = EXCLUDED.do_sat_pm, temp_pm = EXCLUDED.temp_pm;
+                                ''', (
+                                    int(pond_id), selected_date, kilos,
+                                    row["DO AM"] if pd.notnull(row["DO AM"]) else None,
+                                    row["Sat AM %"] if pd.notnull(row["Sat AM %"]) else None,
+                                    row["Temp AM"] if pd.notnull(row["Temp AM"]) else None,
+                                    row["DO PM"] if pd.notnull(row["DO PM"]) else None,
+                                    row["Sat PM %"] if pd.notnull(row["Sat PM %"]) else None,
+                                    row["Temp PM"] if pd.notnull(row["Temp PM"]) else None
+                                ))
                     conn.commit()
                     st.success("✅ ¡Datos guardados exitosamente!")
                     st.cache_data.clear()
@@ -261,10 +286,10 @@ with tab_daily:
         st.warning("No se encontraron piscinas configuradas para CAMAGUI.")
         
     st.divider()
-    st.subheader("📚 Historial de Alimentación Diaria")
+    st.subheader("📚 Historial Diario")
     history_df = load_daily_feed_history()
     if not history_df.empty:
-        st.write("Puedes editar los kilos directamente en la tabla o seleccionar la fila a la izquierda y presionar la tecla **Suprimir/Borrar** para eliminar un registro equivocado.")
+        st.write("Puedes editar cualquier valor directamente en la tabla o seleccionar la fila a la izquierda y presionar **Suprimir/Borrar** para eliminarla.")
         with st.form("history_form"):
             edited_history = st.data_editor(
                 history_df,
@@ -272,7 +297,13 @@ with tab_daily:
                     "log_id": None, 
                     "Date": st.column_config.DateColumn("Fecha", disabled=True),
                     "Pond": st.column_config.TextColumn("Piscina", disabled=True),
-                    "Kilos": st.column_config.NumberColumn("Kilos de Alimento", min_value=0.0)
+                    "Kilos": st.column_config.NumberColumn("Kilos", min_value=0.0, format="%.1f"),
+                    "DO AM": st.column_config.NumberColumn("Oxígeno AM", min_value=0.0, format="%.2f"),
+                    "Sat AM %": st.column_config.NumberColumn("Sat AM %", min_value=0.0, format="%.1f"),
+                    "Temp AM": st.column_config.NumberColumn("Temp AM", min_value=0.0, format="%.1f"),
+                    "DO PM": st.column_config.NumberColumn("Oxígeno PM", min_value=0.0, format="%.2f"),
+                    "Sat PM %": st.column_config.NumberColumn("Sat PM %", min_value=0.0, format="%.1f"),
+                    "Temp PM": st.column_config.NumberColumn("Temp PM", min_value=0.0, format="%.1f")
                 },
                 use_container_width=True,
                 hide_index=True,
@@ -288,11 +319,28 @@ with tab_daily:
                         conn = get_connection()
                         with conn.cursor() as cur:
                             for row_idx_str, cols in changes.get("edited_rows", {}).items():
-                                if "Kilos" in cols:
-                                    row_idx = int(row_idx_str)
-                                    log_id = int(history_df.iloc[row_idx]["log_id"])
-                                    new_kilos = float(cols["Kilos"])
-                                    cur.execute("UPDATE daily_feed_logs SET quantity_kg = %s WHERE log_id = %s", (new_kilos, log_id))
+                                row_idx = int(row_idx_str)
+                                log_id = int(history_df.iloc[row_idx]["log_id"])
+                                
+                                # Construct dynamic update
+                                set_clauses = []
+                                params = []
+                                
+                                field_map = {
+                                    "Kilos": "quantity_kg", "DO AM": "do_am", "Sat AM %": "do_sat_am", 
+                                    "Temp AM": "temp_am", "DO PM": "do_pm", "Sat PM %": "do_sat_pm", "Temp PM": "temp_pm"
+                                }
+                                
+                                for col_name, db_col in field_map.items():
+                                    if col_name in cols:
+                                        set_clauses.append(f"{db_col} = %s")
+                                        val = cols[col_name]
+                                        params.append(float(val) if val is not None else None)
+                                
+                                if set_clauses:
+                                    params.append(log_id)
+                                    query = f"UPDATE daily_feed_logs SET {', '.join(set_clauses)} WHERE log_id = %s"
+                                    cur.execute(query, params)
                             
                             for row_idx in changes.get("deleted_rows", []):
                                 log_id = int(history_df.iloc[row_idx]["log_id"])
